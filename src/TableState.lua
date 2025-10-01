@@ -25,7 +25,7 @@ export type TableState<K, V> = typeof(setmetatable({}, {} :: { __index: any })) 
 	reconcile: (self: TableState<K, V>, newTable: {[K]: V}) -> (),
 	sync: (self: TableState<K, V>, newTable: {[K]: V}) -> (),
 	bind: (self: TableState<K, V>, other: TableState<K, V>) -> RBXScriptConnection,
-	
+
 	state: TableState<K,V>,
 
 	get: (self: TableState<K, V>, key: K) -> V?,
@@ -65,7 +65,7 @@ function TableState.new<K, V>(initialTable: {[K]: V}?): TableState<K, V>
 
 	self._trove = Trove.new()
 	self._state = self._trove:Add(State.new(initialTable or {}))
-	
+
 	self.state = self._state
 
 	-- Fine-grained signals for specific table changes
@@ -274,4 +274,3 @@ end
 TableState.Destroy = TableState.destroy
 
 return TableState
-
