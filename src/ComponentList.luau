@@ -159,6 +159,7 @@ function ComponentList:add(entry, ...)
 end
 
 ComponentList.produce = ComponentList.add
+ComponentList.ensure = ComponentList.add
 
 function ComponentList:remove(entry)
 	-- Removing the entry from the component state will trigger the
