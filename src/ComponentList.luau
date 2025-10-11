@@ -21,22 +21,23 @@ export type ComponentList<E, C> = typeof(setmetatable({}, {} :: { __index: any }
 	add: (self: ComponentList<E, C>, entry: E, ...any) -> C?,
 	remove: (self: ComponentList<E, C>, entry: E) -> (),
 	update: (self: ComponentList<E, C>, newEntries: {E}) -> (),
-	
+
 	state: ComponentList<E,C>,
 
 	-- Reactive Output API (Behaves like a TableState of components)
 	get: (self: ComponentList<E, C>, entry: E) -> C?,
-	produce: (self: ComponentList<E, C>, entry: E) -> C?,
+	produce: (self: ComponentList<E, C>, entry: E, ...any) -> C?,
+	ensure: (self: ComponentList<E, C>, entry: E, ...any) -> C?,
 	getState: (self: ComponentList<E, C>) -> typeof(State.new({})),
-	
+
 	getTableState: (self: ComponentList<E, C>) -> typeof(TableState.new()),
-	
+
 	peek: (self: ComponentList<E, C>) -> {[E]: C},
 	observeEntryAdded: (self: ComponentList<E, C>, callback: (entry: E, component: C) -> ()) -> RBXScriptConnection,
 	observe: (self: ComponentList<E, C>, callback: (entry: E, component: C) -> (), callImmediately:boolean) -> RBXScriptConnection,
 	observeEntryRemoved: (self: ComponentList<E, C>, callback: (entry: E, component: C) -> ()) -> RBXScriptConnection,
 	reduce: (self: ComponentList<E, C>, reducer: (acc: any, component: C, entry: E, use: any) -> any, initialValue: any) -> State.State<any>,
-	
+
 	destroy: (self: ComponentList<E, C>) -> (),
 }
 
@@ -54,7 +55,7 @@ function ComponentList.new<E, C>(producer: (entry: E, trove: Trove) -> C): Compo
 	-- Internal state to hold the managed components, exposed via a TableState.
 	self._componentState = self._trove:Add(TableState.new())
 	self._managedTroves = {} -- Maps data entries to their component's trove
-	
+
 	self.state = self._componentState
 
 	-- When a component is removed from our output state, ensure its trove is cleaned up.
@@ -120,8 +121,8 @@ setmetatable(ComponentList, {
 function ComponentList:reduce(reducerFn, initialValue)
 	-- This method creates and returns a State.computed, configured for reduction.
 	return State.computed(function(use)
-		
-		
+
+
 		-- 1. The top-level dependency is the component list itself.
 		-- If any component is added or removed, the entire reduction re-runs.
 		local components = use(self:getState())
@@ -147,14 +148,14 @@ function ComponentList:add(entry, ...)
 	local componentTrove = self._trove:Extend()
 
 	local componentInstance = self._producer(entry, componentTrove, ...)
-	
+
 	if componentInstance then
 		self._managedTroves[entry] = componentTrove
 		self._componentState:set(entry, componentInstance)
 	else
 		componentTrove:Destroy()
 	end
-	
+
 	return componentInstance
 end
 
@@ -228,4 +229,3 @@ end
 ComponentList.Destroy = ComponentList.destroy
 
 return ComponentList
-
