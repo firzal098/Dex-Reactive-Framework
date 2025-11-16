@@ -12,33 +12,78 @@ local RunService = game:GetService("RunService")
 -- Dependencies
 local Signal = require(ReplicatedStorage.Packages.Signal) --! UPDATE THIS PATH
 local Trove = require(ReplicatedStorage.Packages.Trove) --! UPDATE THIS PATH
+local Animator = require(script.Parent.Animator) --! Animation scheduler
+local Stream = require(script.Parent.Stream)
 
 -- Forward declaration of the State type
-export type State<T> = typeof(setmetatable({}, {} :: { __index: any })) & {
+
+export type State<T> = {
 	_value: T,
 	_changed: Signal,
 	_trove: Trove,
 	_isDeferred: boolean,
 
+	map: <U>(self: State<T>, transformFn: (newValue: T) -> U) -> State<T>,
+	tween: (self: State<T>, tweenInfo: TweenInfo?) -> State<T>,
+	spring: (self: State<T>, damping: number?, frequency: number?) -> State<T>,
+	default: (self: State<T>, value: any) -> State<T>,
+	derive: <U>(self: State<T>, transformFn: (newValue: T) -> U) -> State<T>, 
 	get: (self: State<T>) -> T,
 	peek: (self: State<T>) -> T,
 	set: (self: State<T>, newValue: T) -> State<T>,
 	observe: (self: State<T>, callback: (newValue: T) -> (), callImmediately: boolean?) -> RBXScriptConnection,
 	listen: (self: State<T>, callback: (newValue: T, trove: Trove) -> ()) -> Trove,
 	linkProperty: (self: State<T>, instance: Instance, prop: string) -> RBXScriptConnection,
-	linkAttribute: (self: State<T>, instance: Instance, attribute: string) -> RBXScriptConnection,
+	linkAttribute: (self: State<T>, instance: Instance, prop: string) -> RBXScriptConnection,
 	bind: (self: State<T>, other: State<T>) -> RBXScriptConnection,
 	deferred: (self: State<T>) -> State<T>,
 	immediate: (self: State<T>) -> State<T>,
 	destroy: (self: State<T>) -> (),
-	default: (self: State<T>, value: any) -> State<T>,
+
+
+	changed: Signal,
+	toStream: (self: State<T>) -> Stream.Stream, 
+
 }
+
 
 export type Trove = typeof(Trove.new())
 -- Module
 local State = {}
 State.__index = State
 
+local function evaluate(value)
+	return State.is(value) and value:get() or value
+end
+
+function State:__add(value)
+	self:set(self:get() + evaluate(value));
+	return self
+end
+
+-- Subtraction
+function State:__sub(value)
+	self:set(self:get() - evaluate(value))
+	return self
+end
+
+-- Multiplication
+function State:__mul(value)
+	self:set(self:get() * evaluate(value))
+	return self
+end
+
+-- Division
+function State:__div(value)
+	self:set(self:get() / evaluate(value))
+	return self
+end
+
+-- Exponentiation
+function State:__pow(value)
+	self:set(self:get() ^ evaluate(value))
+	return self
+end
 --[[
 	SCHEDULER FOR DEFERRED UPDATES
 	This centralized system batches all deferred state changes together and fires
@@ -82,6 +127,7 @@ function State.new<T>(initialValue: T): State<T>
 	self._trove = Trove.new()
 	self._isDeferred = false -- All states start in immediate mode by default.
 
+	self.changed = self._changed
 	self._trove:Add(self._changed)
 
 	return self
@@ -93,6 +139,19 @@ end
 -- @return True if the object is a State object, false otherwise.
 function State.is(object: any): boolean
 	return getmetatable(object) == State
+end
+
+
+function State.fromStream(stream: Stream.Stream, initialData): State<any>
+	local streamState = State.new(initialData)
+	
+	streamState._trove:Add(
+		stream:subscribe(function(value)
+			streamState:set(value)
+		end)
+	)
+	
+	return streamState
 end
 
 ---
@@ -124,8 +183,6 @@ end
 -- @param twoWay An optional boolean to enable two-way binding. Defaults to true.
 -- @return A new State object linked to the property.
 function State.fromProperty<T>(instance: Instance, prop: string, twoWay: boolean?): State<T>
-	assert(typeof(instance)=='Instance', 'First argument must be Instance')
-	
 	local new = State.new(instance[prop]::T)
 
 	if twoWay ~= false then
@@ -185,13 +242,25 @@ function State.computed<T>(fn: (use: (dep: State<any>) -> any) -> T): State<T>
 		end
 
 		local newValue = fn(use)
-		-- We use a "silent set" here by directly modifying the internal value
-		-- and then firing the signal. This avoids a potential recursive loop if
-		-- the user's function somehow calls :set() on `current`.
-		if current._value ~= newValue then
-			current._value = newValue
-			current._changed:Fire(newValue)
+		
+		if State.is(newValue) then
+			-- If the function returned a State object, we use its value.
+			depsTrove:Add(newValue:observe(function(v)
+				if current._value ~= v then
+					current._value = v
+					current._changed:Fire(v)
+				end		
+			end,true))
+		else
+			-- We use a "silent set" here by directly modifying the internal value
+			-- and then firing the signal. This avoids a potential recursive loop if
+			-- the user's function somehow calls :set() on `current`.
+			if current._value ~= newValue then
+				current._value = newValue
+				current._changed:Fire(newValue)
+			end	
 		end
+		
 	end
 
 	function scheduleUpdate()
@@ -223,24 +292,42 @@ end
 -- @param instance {Instance} The instance to hydrate with stateful properties.
 -- @param props {{[string]: any}} A dictionary where keys are property names and values are State objects or static values.
 -- @return {Instance, Trove} The instance that was hydrated, and the Trove object managing the connections.
-function State.hydrate(instance: Instance, props: {[string]: any}): (Instance, Trove)
+function State.hydrate(instance: Instance, props: {[string]: any}): (Trove, {[string]: State<any>})
 	local cleanupTrove = Trove.new()
+	
+	local states = {}
 
 	for propName, value in pairs(props) do
-		if State.is(value) then
-			-- If the value is a State object, create a reactive link.
-			local connection = value:linkProperty(instance, propName)
-			cleanupTrove:Add(connection)
+		if typeof(instance[propName]) == 'RBXScriptSignal' then
+			cleanupTrove:Connect(instance[propName], value)
 		else
-			-- If it's a static value, just set the property directly.
-			instance[propName] = value
+			if State.is(value) then
+				-- If the value is a State object, create a reactive link.
+				local connection = value:linkProperty(instance, propName)
+				cleanupTrove:Add(connection)
+
+				states[propName] = connection
+			else
+				-- If it's a static value, just set the property directly.
+				instance[propName] = value
+			end
 		end
+		
 	end
 
 	-- Automatically tie the cleanup trove's lifecycle to the instance.
 	cleanupTrove:AttachToInstance(instance)
 
-	return instance, cleanupTrove
+	return cleanupTrove--, states
+end
+
+
+function State.hydrateBatch(instances: {Instance}, props: {[string]:any})
+	local mainTrove = Trove.new()
+	for _,v in instances do
+		mainTrove:Add(State.hydrate(v, props))
+	end
+	return mainTrove
 end
 
 -- Allows creating a new state with `State(value)` instead of `State.new(value)`.
@@ -248,6 +335,7 @@ setmetatable(State, {
 	__call = function(_, initialValue)
 		return State.new(initialValue)
 	end,
+	
 })
 
 
@@ -279,6 +367,22 @@ function State:set<T>(value: T): State<T>
 
 	return self
 end
+
+function State:toStream()
+	local stateStream = Stream.new()
+	
+	self._trove:Add(stateStream)
+	
+	local old = self:get()
+	
+	stateStream:add(self:observe(function(val)
+		stateStream:emit(val, old)
+		old = val
+	end, true))
+	
+	return stateStream
+end
+
 
 -- Sets default value of state
 function State:default<T>(value:T): State<T>
@@ -328,12 +432,11 @@ function State:listen<T>(callback: (newValue: T, trove: Trove) -> nil): Trove
 	activeTrove:Add(self:observe(update))
 	
 	activeTrove:Add(function()
+
 		if valueTrove then
 			valueTrove:Destroy()
 		end
 	end)
-	
-	self._trove:Add(activeTrove)
 
 	return activeTrove
 end
@@ -385,18 +488,18 @@ function State:linkProperty(instance: Instance, prop: string): RBXScriptConnecti
 	end, true)
 end
 
-
 ---
 -- Links the state's value to an instance's attribute.
--- The property will be updated immediately and whenever the state changes.
+-- The attribute will be updated immediately and whenever the state changes.
 -- @param instance The instance to modify.
 -- @param prop The name of the property to change.
 -- @return A Signal connection that can be disconnected to stop the link.
-function State:linkAttribute(instance: Instance, attribute: string): RBXScriptConnection
+function State:linkAttribute(instance: Instance, prop: string): RBXScriptConnection
 	return self:observe(function(newValue)
-		instance:SetAttribute(attribute,newValue)
+		instance:SetAttribute(prop,newValue)
 	end, true)
 end
+
 
 ---
 -- Binds this state to another state. This state's value will be set to the other's
@@ -410,12 +513,168 @@ function State:bind<T>(other: State<T>): RBXScriptConnection
 	end)
 end
 
+
+---
+-- Creates a new, read-only State by applying a function to the parent state's value.
+-- This derived state automatically updates when the parent changes and is cleaned up
+-- when the parent is destroyed. It's a convenient shorthand for `State.computed`.
+--
+-- @param transformFn (parentValue) -> newValue
+-- @return {State} A new, read-only derived State.
+function State:derive(transformFn): State<any>
+	-- 'self' is the original state object
+	local sourceState = self
+
+	local derivedState = State.computed(function(use)
+		-- Call the user's function with the raw value
+		return transformFn(use(sourceState))
+	end)
+	
+	sourceState._trove:Add(derivedState)
+	
+	return derivedState
+end
+State.map = State.derive
+---
+-- Creates a new read-only State that smoothly animates towards the parent state's value over time.
+-- The returned State is read-only and its lifecycle is tied to the parent State.
+-- Supports numbers, Vector2, Vector3, UDim2, and Color3 by default, or any type with a custom `lerpFn`.
+--
+-- @param tweenInfo (Optional) A TweenInfo object describing the animation. Defaults to a 0.3s Quad Out tween.
+-- @param lerpFn (Optional) A custom function `(start, goal, alpha) -> result` for interpolating unsupported types.
+-- @return {State} A new, read-only State with the animated value.
+function State:tween(tweenInfo, lerpFn)
+	local sourceState = self
+	local animatedState = State.new(sourceState:peek())
+	sourceState._trove:Add(animatedState)
+
+	local startValue = sourceState:peek()
+	local goal = sourceState:peek()
+	local alpha = 1 -- Start at 1 so we are 'complete' initially
+
+	local tInfo = tweenInfo or TweenInfo.new(0.3)
+
+	local animationJob = {
+		update = function(dt)
+			if alpha >= 1 then
+				return false -- Animation is complete
+			end
+
+			alpha = math.min(1, alpha + dt / tInfo.Time)
+			local currentAlpha = game:GetService("TweenService"):GetValue(alpha, tInfo.EasingStyle, tInfo.EasingDirection)
+
+			if not lerpFn and typeof(goal) == 'number' then
+				lerpFn = math.lerp
+			end
+
+			local result
+			if lerpFn then
+				result = lerpFn(startValue, goal, currentAlpha)
+			else
+				result = startValue:Lerp(goal, currentAlpha)
+			end
+
+			animatedState:set(result)
+			return true -- Animation is still active
+		end
+	}
+
+	-- When the parent state changes, update the goal and restart the animation.
+	sourceState:observe(function(newGoal)
+		if newGoal == goal then return end
+
+		startValue = animatedState:peek()
+		goal = newGoal
+		alpha = 0
+		Animator.add(animationJob)
+	end)
+
+	-- When the animated state is destroyed, remove its job from the scheduler.
+	animatedState._trove:Add(function()
+		Animator.remove(animationJob)
+	end)
+	
+	return animatedState
+end
+
+---
+-- Creates a new read-only State that animates towards the parent state's value using spring physics.
+-- The returned State is read-only and its lifecycle is tied to the parent State.
+-- Supports numbers and Vector3.
+--
+-- @param damping (Optional) The spring's damping ratio. Higher values are stiffer. Defaults to 1.
+-- @param frequency (Optional) The spring's frequency. Higher values are faster. Defaults to 5.
+-- @return {State} A new, read-only State with the animated value.
+function State:spring(damping, frequency)
+	local sourceState = self
+	local animatedState = State.new(sourceState:peek())
+	sourceState._trove:Add(animatedState)
+
+	damping = damping or 1
+	frequency = frequency or 5
+
+	local velocity
+	local valueType = typeof(sourceState:peek())
+	if valueType == "number" then
+		velocity = 0
+	elseif valueType == "Vector3" then
+		velocity = Vector3.new()
+	else
+		error("State:spring only supports number and Vector3 values.", 2)
+	end
+
+	local animationJob = {
+		update = function(dt)
+			local current = animatedState:peek()
+			local goal = sourceState:peek()
+
+			local isComplete
+			if valueType == "number" then
+				isComplete = math.abs(current - goal) < 0.001 and math.abs(velocity) < 0.001
+			else -- Vector3
+				isComplete = (current - goal).Magnitude < 0.001 and velocity.Magnitude < 0.001
+			end
+
+			if isComplete then
+				if current ~= goal then animatedState:set(goal) end
+				return false -- Animation complete
+			end
+
+			-- Spring physics calculation (critically damped spring)
+			local f = 1 + 2 * dt * damping * frequency
+			local oo = frequency * frequency
+			local hoo = dt * oo
+			local hhoo = dt * hoo
+			local detInv = 1 / (f + hhoo)
+			local detX = (f * current) + (dt * velocity) + (hhoo * goal)
+			local detV = velocity + (hoo * (goal - current))
+
+			velocity = detV * detInv
+			animatedState:set(detX * detInv)
+
+			return true -- Animation active
+		end,
+	}
+
+	-- When the parent state changes, kickstart the animation.
+	sourceState:observe(function()
+		Animator.add(animationJob)
+	end)
+
+	-- When the animated state is destroyed, remove its job from the scheduler.
+	animatedState._trove:Add(function()
+		Animator.remove(animationJob)
+	end)
+	
+
+	return animatedState
+end
+
 ---
 -- Destroys the state object and cleans up all its connections and signals.
 function State:destroy()
 	self._trove:Destroy()
 end
-
 
 
 return State
