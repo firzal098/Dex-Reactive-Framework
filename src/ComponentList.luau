@@ -16,19 +16,20 @@ local TableState = require(script.Parent.TableState)
 type Trove = Trove.Trove
 
 -- Type Declaration
-export type ComponentList<E, C> = typeof(setmetatable({}, {} :: { __index: any })) & {
+export type ComponentList<E, C> =  {
 	-- Manual Control API
 	add: (self: ComponentList<E, C>, entry: E, ...any) -> C?,
 	remove: (self: ComponentList<E, C>, entry: E) -> (),
 	update: (self: ComponentList<E, C>, newEntries: {E}) -> (),
+	clear: (self: ComponentList<E,C>) -> (),
 
 	state: ComponentList<E,C>,
 
 	-- Reactive Output API (Behaves like a TableState of components)
+	ensure: (self: ComponentList<E, C>, entry: E, ...any) -> C,
 	get: (self: ComponentList<E, C>, entry: E) -> C?,
 	produce: (self: ComponentList<E, C>, entry: E, ...any) -> C?,
-	ensure: (self: ComponentList<E, C>, entry: E, ...any) -> C?,
-	getState: (self: ComponentList<E, C>) -> typeof(State.new({})),
+	getState: (self: ComponentList<E, C>) -> State.State<{[E]:C}>,
 
 	getTableState: (self: ComponentList<E, C>) -> typeof(TableState.new()),
 
@@ -39,14 +40,27 @@ export type ComponentList<E, C> = typeof(setmetatable({}, {} :: { __index: any }
 	reduce: (self: ComponentList<E, C>, reducer: (acc: any, component: C, entry: E, use: any) -> any, initialValue: any) -> State.State<any>,
 
 	destroy: (self: ComponentList<E, C>) -> (),
+	
+	map: <U>(self: ComponentList<E,C>, transformFn: (entry: C, trove: Trove, ...any) -> U) -> ComponentList<C,U>; 
 }
+
+local function isDifferent(t1,t2)
+	for i = 1, math.max(#t1, #t2) do
+		if t1[i] ~= t2[i] then
+			return true
+		end
+	end
+	return false
+end
 
 -- Module
 local ComponentList = {}
 ComponentList.__index = ComponentList
 
+ComponentList.None = newproxy()
+
 --- The basic constructor for creating a manual ComponentList.
-function ComponentList.new<E, C>(producer: (entry: E, trove: Trove) -> C): ComponentList<E, C>
+function ComponentList.new<E, C>(producer: (entry: E, trove: Trove, ...any) -> C): ComponentList<E, C>
 	local self = setmetatable({}, ComponentList)
 
 	self._trove = Trove.new()
@@ -55,16 +69,21 @@ function ComponentList.new<E, C>(producer: (entry: E, trove: Trove) -> C): Compo
 	-- Internal state to hold the managed components, exposed via a TableState.
 	self._componentState = self._trove:Add(TableState.new())
 	self._managedTroves = {} -- Maps data entries to their component's trove
-
+	self._deps = {}
+	
 	self.state = self._componentState
 
 	-- When a component is removed from our output state, ensure its trove is cleaned up.
 	self._trove:Add(self._componentState:observeEntryRemoved(function(entry, _)
 		local componentTrove = self._managedTroves[entry]
+		
+		self._managedTroves[entry] = nil
+		
 		if componentTrove then
 			self._trove:Remove(componentTrove)
-			self._managedTroves[entry] = nil
 		end
+		
+		self._deps[entry] = nil
 	end))
 
 	return self
@@ -85,6 +104,31 @@ function ComponentList.fromTableState<E, C>(
 		self:add(entry)
 	end))
 	self._trove:Add(sourceData:observeEntryRemoved(function(entry, _)
+		self:remove(entry)
+	end))
+
+	return self
+end
+
+function ComponentList.fromTableStateValues<E,C>(
+	sourceData: typeof(TableState.new()),
+	producer: (entry: E, trove: Trove) -> C
+): ComponentList<E,C>
+	
+	local self = ComponentList.new(producer)
+
+	---- Initial sync
+	--self:update(sourceData:peek())
+	
+	for _, value in sourceData:peek() do
+		self:add(value)
+	end
+
+	-- Listen for fine-grained changes for efficiency
+	self._trove:Add(sourceData:observeEntryAdded(function(_, entry)
+		self:add(entry)
+	end))
+	self._trove:Add(sourceData:observeEntryRemoved(function(_, entry)
 		self:remove(entry)
 	end))
 
@@ -142,6 +186,16 @@ end
 
 function ComponentList:add(entry, ...)
 	if self._managedTroves[entry] then
+		
+		local component = self._componentState:get(entry)
+		
+		if isDifferent({...}, self._deps[entry]) then
+			if typeof(component) == 'table' and component.onChange then
+				component.onChange(...)
+				self._deps[entry] = {...}
+			end
+		end
+		
 		return self._componentState:get(entry)
 	end
 
@@ -149,10 +203,13 @@ function ComponentList:add(entry, ...)
 
 	local componentInstance = self._producer(entry, componentTrove, ...)
 
+	self._deps[entry] = {...}
+
 	if componentInstance then
 		self._managedTroves[entry] = componentTrove
 		self._componentState:set(entry, componentInstance)
 	else
+		warn('[ComponentList] Warning: .add() returned nil for entry: ', entry, ' ')
 		componentTrove:Destroy()
 	end
 
@@ -171,7 +228,7 @@ end
 function ComponentList:update(newEntries)
 	local desiredState = {}
 	-- The entries in a dictionary are the keys, in an array they are the values
-	local isArray = #newEntries > 0 or next(newEntries) == nil
+	local isArray = #newEntries > 0
 
 	if isArray then
 		for _, entry in ipairs(newEntries) do
@@ -179,7 +236,7 @@ function ComponentList:update(newEntries)
 			self:add(entry)
 		end
 	else
-		for entry in pairs(newEntries) do
+		for entry, v in pairs(newEntries) do
 			desiredState[entry] = true
 			self:add(entry)
 		end
@@ -192,7 +249,20 @@ function ComponentList:update(newEntries)
 	end
 end
 
+function ComponentList:clear()
+	self:update({})
+end
+
 --== Delegate API (Behaves like a TableState) ==--
+
+function ComponentList:map(transformFn)
+	local derivedComponentList = ComponentList.fromTableStateValues(self._componentState, transformFn)
+	local trove:Trove.Trove = self._trove
+	
+	trove:Add(derivedComponentList)
+	
+	return derivedComponentList
+end
 
 function ComponentList:get(entry)
 	return self._componentState:get(entry)
