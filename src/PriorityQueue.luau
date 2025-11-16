@@ -126,6 +126,8 @@ export type PriorityQueue = {
 	--- Returns the number of items in the queue.
 	size: (self: PriorityQueue) -> number,
 
+	pipe: (self: PriorityQueue, handler: (value:any)->()) -> (),
+
 	--// Internal Methods //--
 
 	--- Updates the internal head state based on the current highest-priority item.
@@ -280,6 +282,10 @@ function priority_queue.new(handler: ((newValue: any?) -> ())?, instanceFolder: 
 	return self
 end
 
+function priority_queue:pipe(handler)
+	self._trove:Connect(self.changed, handler)
+	handler(self.value:get())
+end
 ---
 -- A static helper function to create an Instance with the correct attributes
 -- for a queue to consume when using the `instanceFolder` feature.
