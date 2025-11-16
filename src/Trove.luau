@@ -9,7 +9,10 @@ local FN_MARKER = newproxy()
 local THREAD_MARKER = newproxy()
 local GENERIC_OBJECT_CLEANUP_METHODS = { "Destroy", "Disconnect", "destroy", "disconnect", 'remove', 'Remove' }
 
+local metatable_cleanups = {}
 local RunService = game:GetService("RunService")
+
+local Promise = require(script.Parent.Promise)
 
 local function GetObjectCleanupFunction(object, cleanupMethod)
 	local t = typeof(object)
@@ -53,6 +56,10 @@ end
 ]=]
 local Trove = {}
 Trove.__index = Trove
+
+function Trove.__call<T>(self, object:T, cleanupMethod):T
+	return Trove.Add(self, object, cleanupMethod)
+end
 
 --[=[
 	@return Trove
@@ -217,7 +224,7 @@ end
 	This is only compatible with the [roblox-lua-promise](https://eryn.io/roblox-lua-promise/) library, version 4.
 	:::
 ]=]
-function Trove:AddPromise<T>(promise:T):T
+function Trove:AddPromise(promise): typeof(Promise.new())
 	if self._cleaning then
 		error("Cannot call trove:AddPromise() while cleaning", 2)
 	end
@@ -385,6 +392,23 @@ end
 ]=]
 function Trove:Destroy()
 	self:Clean()
+end
+
+
+function Trove:WrapAdd()
+	return function<T>(obj:T): T
+		if Promise.is(obj) then
+			return self:AddPromise(obj)
+		else
+			return self:Add(obj)
+		end
+	end
+end
+
+function Trove:Batch(objects)
+	for _, object in objects do
+		self:Add(object)
+	end
 end
 
 export type Trove = typeof(Trove.new())
